@@ -39,9 +39,10 @@ from app.backend.core.supabase import (
     insert_row,
     select_maybe,
     select_rows,
+    update_rows,
     upsert_row,
 )
-from app.schemas.memory import ExperienceLevel, MemoryNote, UserProfile
+from app.schemas.memory import ExperienceLevel, MemoryNote, TradingConfig, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,65 @@ class MemoryService:
         # Experience level feeds the agent prompt, so bust the prompt cache too.
         await self._invalidate(user_id)
         return UserProfile.model_validate(rows[0] if rows else payload)
+
+    async def patch_trading_config(
+        self, user_id: str, patch: dict[str, Any]
+    ) -> UserProfile:
+        """Merge-patch ``user_profiles.trading`` with user-supplied fields.
+
+        We use UPDATE (not upsert) so Supabase never overwrites untouched
+        profile columns with their column defaults. The old upsert approach
+        caused ``enabled: true`` to be silently reverted to the column
+        default ``false`` for any field absent from the payload.
+
+        Merge order: existing DB values ← incoming patch (patch wins for
+        every key that was actually supplied).
+        """
+        current = await self.get_profile(user_id)
+        trading = current.trading if current else TradingConfig()
+
+        # Merge: start from the full current config, then overlay whatever
+        # the caller supplied. We do NOT filter out False/0 values — those
+        # are intentional writes (e.g. disabling trading or llm_proposals).
+        merged = trading.model_dump()
+        merged.update(patch)
+        validated = TradingConfig.model_validate(merged)
+
+        trading_payload = validated.model_dump(mode="json")
+
+        # Prefer UPDATE so only the ``trading`` column is touched, leaving
+        # experience_level and all other columns exactly as they were.
+        rows = await asyncio.to_thread(
+            update_rows,
+            _PROFILE_TABLE,
+            {"trading": trading_payload},
+            filters={"user_id": user_id},
+        )
+
+        # Profile row might not exist yet for a brand-new user.
+        if not rows:
+            upsert_payload = {
+                "user_id": user_id,
+                "trading": trading_payload,
+            }
+            rows = await asyncio.to_thread(
+                upsert_row, _PROFILE_TABLE, upsert_payload, on_conflict="user_id"
+            )
+
+        logger.info(
+            "[trade] trading_config_updated user=%s enabled=%s max_order=%s",
+            user_id,
+            validated.enabled,
+            validated.max_order_usd,
+        )
+        if rows:
+            return UserProfile.model_validate(rows[0])
+        return current
+
+    async def acknowledge_trading_disclaimer(self, user_id: str) -> UserProfile:
+        return await self.patch_trading_config(
+            user_id, {"disclaimer_acknowledged_at": _now_iso()}
+        )
 
     # -------------------------------------------------------------- memory API
 

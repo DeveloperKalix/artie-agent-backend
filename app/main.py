@@ -20,6 +20,7 @@ from app.routes.profile import router as profile_router
 from app.routes.recommendations import router as recommendations_router
 from app.routes.skills import router as skills_router
 from app.routes.snaptrade import router as snaptrade_router
+from app.routes.trade import router as trade_router
 
 # Surface INFO logs from our own modules under uvicorn's default stream handler.
 # ``force=True`` ensures this takes effect even if uvicorn has already attached
@@ -41,10 +42,14 @@ async def lifespan(app: FastAPI):
     a boot-time ingest so the news table is populated before the first user
     request hits ``/news`` or ``/recommendations``.
     """
+    from app.backend.core.redis import get_redis
     from app.backend.services.news import get_news_agent
+    from app.backend.services.order_intents import get_order_intent_service
 
     scheduler = build_scheduler()
     news_agent = get_news_agent()
+    order_intents = get_order_intent_service()
+    redis_client = get_redis()
 
     interval_min = int(os.getenv("NEWS_INGEST_INTERVAL_MINUTES", "60"))
     scheduler.add_job(
@@ -56,12 +61,52 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+
+    # Trade reminder poller — fires market-open reminders for any
+    # "scheduled_for_market_open" intents whose next NYSE open has passed.
+    # Guarded by a short Redis lease so only one worker does the scan per
+    # 60-second tick; the atomic claim in _claim_due_reminders keeps us
+    # safe even if two workers briefly win the lease.
+    poll_seconds = int(os.getenv("TRADE_REMINDER_POLL_SECONDS", "60"))
+
+    async def _poll_trade_reminders() -> None:
+        try:
+            acquired = await redis_client.set(
+                "trade:reminder:lease",
+                "1",
+                nx=True,
+                ex=max(10, poll_seconds - 5),
+            )
+        except Exception:
+            logger.warning("[trade] reminder lease redis failure", exc_info=True)
+            acquired = True  # fail-open; the SQL claim is the real guard.
+        if not acquired:
+            return
+        try:
+            count = await order_intents.process_due_reminders()
+            if count:
+                logger.info("[trade] reminder_poller processed=%d", count)
+        except Exception:
+            logger.exception("[trade] reminder_poller tick failed")
+
+    scheduler.add_job(
+        _poll_trade_reminders,
+        trigger="interval",
+        seconds=poll_seconds,
+        id="trade_reminder_poller",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     scheduler.start()
     app.state.scheduler = scheduler
     app.state.news_agent = news_agent
+    app.state.order_intents = order_intents
     logger.info(
-        "[lifespan] scheduler started, news_ingest every %d minutes",
+        "[lifespan] scheduler started, news_ingest every %d min, trade_reminder_poller every %d s",
         interval_min,
+        poll_seconds,
     )
 
     # Boot-time ingest (fire-and-forget so startup isn't blocked).
@@ -155,6 +200,7 @@ for _prefix in ("/api/v1", ""):
     app.include_router(skills_router, prefix=_prefix)
     app.include_router(profile_router, prefix=_prefix)
     app.include_router(recommendations_router, prefix=_prefix)
+    app.include_router(trade_router, prefix=_prefix)
 
 # Initialize Clients
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))

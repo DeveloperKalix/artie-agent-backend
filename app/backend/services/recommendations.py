@@ -76,6 +76,63 @@ _AUTOGEN_LOCK_PREFIX = "recs:autogen:"
 
 _CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
 
+# Groq/OpenAI-style tool schema for the LLM's ``propose_order`` function.
+# Keep this minimal — Groq's llama-3.3 is more reliable with shallow schemas
+# than deep JSON-schema trees. The orchestrator validates the returned
+# arguments against :class:`LLMProposedOrder` before touching SnapTrade.
+_PROPOSE_ORDER_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_order",
+            "description": (
+                "Propose a buy or sell order for the user's review. NEVER "
+                "executes directly — the user must tap Confirm in the UI. "
+                "Use only when the user clearly asks to trade a specific "
+                "ticker or crypto pair."
+            ),
+            "parameters": {
+                "type": "object",
+                "required": ["asset_class", "symbol", "action"],
+                "properties": {
+                    "asset_class": {"type": "string", "enum": ["equity", "crypto"]},
+                    "account_id": {
+                        "type": "string",
+                        "description": (
+                            "SnapTrade account id shown in the portfolio context above "
+                            "(e.g. 'account_id=abc-123'). Omit if unsure — the server "
+                            "will pick the best account automatically."
+                        ),
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Ticker (equity) or pair 'BTC/USD' (crypto).",
+                    },
+                    "action": {"type": "string", "enum": ["buy", "sell"]},
+                    "order_type": {
+                        "type": "string",
+                        "enum": ["market", "limit", "stop", "stop_limit"],
+                        "default": "market",
+                    },
+                    "time_in_force": {
+                        "type": "string",
+                        "enum": ["day", "gtc", "fok", "ioc"],
+                        "default": "day",
+                    },
+                    "units": {"type": "number", "minimum": 0},
+                    "notional_value": {"type": "number", "minimum": 0},
+                    "price": {"type": "number", "minimum": 0},
+                    "stop": {"type": "number", "minimum": 0},
+                    "rationale": {
+                        "type": "string",
+                        "description": "One-sentence explanation for the user.",
+                    },
+                },
+            },
+        },
+    }
+]
+
 _TONE_BY_LEVEL: dict[ExperienceLevel, str] = {
     ExperienceLevel.novice: (
         "The user is a novice investor. Use plain language, avoid jargon, "
@@ -314,8 +371,47 @@ class RecommendationAgent:
         history: list[dict[str, Any]] | None = None,
     ) -> str:
         """Return a conversational reply grounded in the user's portfolio."""
+        outcome = await self.chat_with_tools(
+            user_id=user_id,
+            message=message,
+            history=history,
+            allow_propose_order=False,
+        )
+        return outcome["text"]
+
+    async def chat_with_tools(
+        self,
+        *,
+        user_id: str,
+        message: str,
+        history: list[dict[str, Any]] | None = None,
+        allow_propose_order: bool = False,
+    ) -> dict[str, Any]:
+        """Chat turn with optional ``propose_order`` tool-calling.
+
+        Returns a dict with:
+          * ``text`` — the assistant's reply (non-empty even when a tool was called).
+          * ``proposal`` — raw dict payload from the LLM's ``propose_order``
+            tool call, or ``None`` if the model didn't call a tool. The
+            orchestrator validates this against :class:`LLMProposedOrder`
+            before creating an intent.
+
+        The LLM is told it MUST NOT execute orders — tool calls always
+        become user-facing confirmations. This is enforced at the
+        ``OrderIntentService`` layer too: :meth:`create_from_llm` creates an
+        intent in ``awaiting_confirmation`` and never auto-submits.
+        """
         ctx = await self._collect_context(user_id)
         system_prompt = self._build_system_prompt(ctx, mode="chat")
+        if allow_propose_order:
+            system_prompt += (
+                "\n\nYou MAY call the ``propose_order`` tool when the user "
+                "clearly asks to buy or sell a specific ticker (equities or "
+                "crypto). NEVER use the tool on vague messages. Tool calls "
+                "are ALWAYS surfaced to the user for tap-to-confirm — you "
+                "are never placing an order directly. Always include a "
+                "short rationale alongside the tool call."
+            )
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for turn in (history or [])[-_MAX_CONTEXT_TURNS:]:
@@ -325,7 +421,8 @@ class RecommendationAgent:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
 
-        return await self._call_groq_chat(messages)
+        tools = _PROPOSE_ORDER_TOOLS if allow_propose_order else None
+        return await self._call_groq_chat_with_tools(messages, tools=tools)
 
     # ----------------------------------------------------- context collection
 
@@ -529,6 +626,61 @@ class RecommendationAgent:
                 temperature=0.4,
             )
             return (completion.choices[0].message.content or "").strip()
+
+        return await asyncio.to_thread(_sync)
+
+    async def _call_groq_chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        """Groq completion that may return a ``propose_order`` tool call.
+
+        Returns ``{"text": str, "proposal": dict | None}``. The model can
+        both call the tool and produce text alongside it — we preserve
+        both so the orchestrator can echo the rationale into chat while
+        rendering the confirm card.
+        """
+        from app.main import groq_client
+
+        def _sync() -> dict[str, Any]:
+            kwargs: dict[str, Any] = {
+                "model": _CHAT_MODEL,
+                "messages": messages,
+                "temperature": 0.4,
+            }
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            completion = groq_client.chat.completions.create(**kwargs)
+            choice = completion.choices[0].message
+            text = (getattr(choice, "content", None) or "").strip()
+            proposal: dict[str, Any] | None = None
+            tool_calls = getattr(choice, "tool_calls", None) or []
+            for call in tool_calls:
+                fn = getattr(call, "function", None) or {}
+                name = getattr(fn, "name", None) or (
+                    fn.get("name") if isinstance(fn, dict) else None
+                )
+                if name != "propose_order":
+                    continue
+                raw_args = getattr(fn, "arguments", None) or (
+                    fn.get("arguments") if isinstance(fn, dict) else None
+                )
+                if isinstance(raw_args, str):
+                    try:
+                        proposal = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "[recommendations] propose_order args not JSON: %r",
+                            raw_args[:200],
+                        )
+                        proposal = None
+                elif isinstance(raw_args, dict):
+                    proposal = raw_args
+                break
+            return {"text": text, "proposal": proposal}
 
         return await asyncio.to_thread(_sync)
 
@@ -809,8 +961,11 @@ def _format_positions_block(positions: list[dict[str, Any]]) -> str:
         cost = pos.get("average_purchase_price")
         mv = pos.get("market_value")
         unreal = pos.get("unrealized_gain")
+        account_id = pos.get("account_id") or ""
+        # Include account_id so the LLM can pass it to propose_order.
+        account_hint = f" account_id={account_id}" if account_id else ""
         lines.append(
-            f"- {symbol}: qty={qty} cost_basis={cost} price={price} "
+            f"- {symbol}:{account_hint} qty={qty} cost_basis={cost} price={price} "
             f"market_value={mv} unrealized={unreal}"
         )
     return "\n".join(lines)

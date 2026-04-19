@@ -611,6 +611,327 @@ class SnapTradeService:
             app_user_id,
         )
 
+    # ------------------------------------------------------------------
+    # Trading — symbols, quotes, order preview/place/cancel
+    # ------------------------------------------------------------------
+    #
+    # All trading methods delegate to the ``trading`` and ``reference_data``
+    # namespaces on ``SnapTrade``. Previews (``get_order_impact``) return a
+    # ``trade_id`` that is valid for ~5 minutes. The caller (``OrderIntentService``)
+    # persists that id and calls ``place_equity_order(trade_id=...)`` to
+    # execute. We never forward the raw SDK model — responses are always
+    # normalised via ``_safe`` + ``json.loads(json.dumps(...))`` so downstream
+    # code can treat them as plain JSON dicts.
+    #
+    # Errors: ``ApiException`` is re-raised so routes can translate it to the
+    # correct HTTP status. ``LookupError`` is raised only when the user has
+    # not called ``POST /snaptrade/connect`` yet.
+
+    def _require_auth(self, app_user_id: str) -> dict[str, str]:
+        row = select_maybe(
+            _TABLE,
+            "snaptrade_user_id",
+            "user_secret",
+            filters={"app_user_id": app_user_id},
+        )
+        if not row:
+            raise LookupError(
+                "No SnapTrade registration found for this user. "
+                "Call POST /snaptrade/connect first."
+            )
+        return row
+
+    def search_symbol(
+        self, app_user_id: str, *, account_id: str | None, query: str
+    ) -> list[dict]:
+        """Search for tradable symbols.
+
+        When ``account_id`` is provided we use the account-scoped search so
+        results are limited to symbols that broker actually supports (e.g.
+        Robinhood won't return the same OTC tickers Fidelity does). Without
+        an account we fall back to the global reference-data search.
+        """
+        auth = self._require_auth(app_user_id)
+        try:
+            if account_id:
+                # Account-scoped symbol search lives on ReferenceDataApi in the
+                # snaptrade_client SDK (NOT TradingApi — that only exposes the
+                # crypto-pair instrument search). Results are filtered to the
+                # symbols this broker actually supports for the account.
+                resp = self._client.reference_data.symbol_search_user_account(
+                    user_id=auth["snaptrade_user_id"],
+                    user_secret=auth["user_secret"],
+                    account_id=account_id,
+                    substring=query,
+                )
+            else:
+                resp = self._client.reference_data.get_symbols(
+                    body={"substring": query},
+                )
+        except ApiException as e:
+            logger.warning("[snaptrade] search_symbol failed q=%r: %s", query, e)
+            raise
+        body = getattr(resp, "body", None) or []
+        return json.loads(json.dumps(_safe(body)))
+
+    def account_quote(
+        self, app_user_id: str, *, account_id: str, symbols: str, use_ticker: bool = True
+    ) -> list[dict]:
+        """Return account-scoped quotes for one or more symbols.
+
+        SnapTrade discourages using this endpoint as a primary market-data
+        feed (it's broker-dependent and can be throttled), but it's the
+        correct way to get a pre-trade price estimate for display in the
+        order composer. ``symbols`` is a comma-separated list of tickers
+        when ``use_ticker=True``, otherwise universal symbol IDs.
+        """
+        auth = self._require_auth(app_user_id)
+        try:
+            resp = self._client.trading.get_user_account_quotes(
+                user_id=auth["snaptrade_user_id"],
+                user_secret=auth["user_secret"],
+                account_id=account_id,
+                symbols=symbols,
+                use_ticker=use_ticker,
+            )
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] account_quote failed account=%s symbols=%s: %s",
+                account_id,
+                symbols,
+                e,
+            )
+            raise
+        body = getattr(resp, "body", None) or []
+        return json.loads(json.dumps(_safe(body)))
+
+    def preview_equity_order(
+        self,
+        app_user_id: str,
+        *,
+        account_id: str,
+        action: str,
+        order_type: str,
+        time_in_force: str,
+        universal_symbol_id: str | None = None,
+        symbol: str | None = None,
+        units: float | None = None,
+        notional_value: float | None = None,
+        price: float | None = None,
+        stop: float | None = None,
+    ) -> dict:
+        """Run SnapTrade's ``/trade/impact`` to preview an equity order.
+
+        Returns a dict containing ``trade`` (with a ``id`` field — the
+        ephemeral ``trade_id`` valid for 5 minutes) and ``trade_impact``
+        (commission, buying power, estimated value, etc.). The caller
+        stores these and later calls :meth:`place_equity_order` with the
+        ``trade_id`` inside that window.
+
+        Either ``universal_symbol_id`` OR ``symbol`` should be provided —
+        the former is preferred since it's unambiguous across exchanges.
+        """
+        auth = self._require_auth(app_user_id)
+        kwargs: dict[str, Any] = {
+            "user_id": auth["snaptrade_user_id"],
+            "user_secret": auth["user_secret"],
+            "account_id": account_id,
+            "action": action.upper(),
+            "order_type": _map_order_type(order_type),
+            "time_in_force": _map_time_in_force(time_in_force),
+        }
+        if universal_symbol_id:
+            kwargs["universal_symbol_id"] = universal_symbol_id
+        if units is not None:
+            kwargs["units"] = float(units)
+        if notional_value is not None:
+            kwargs["notional_value"] = float(notional_value)
+        if price is not None:
+            kwargs["price"] = float(price)
+        if stop is not None:
+            kwargs["stop"] = float(stop)
+
+        try:
+            resp = self._client.trading.get_order_impact(**kwargs)
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] preview_equity_order failed account=%s sym=%s: %s",
+                account_id,
+                universal_symbol_id or symbol,
+                e,
+            )
+            raise
+        body = getattr(resp, "body", None) or {}
+        return json.loads(json.dumps(_safe(body)))
+
+    def place_equity_order(
+        self,
+        app_user_id: str,
+        *,
+        trade_id: str,
+        wait_to_confirm: bool = False,
+    ) -> dict:
+        """Execute a previously-previewed equity order within its 5-minute window."""
+        auth = self._require_auth(app_user_id)
+        try:
+            resp = self._client.trading.place_order(
+                user_id=auth["snaptrade_user_id"],
+                user_secret=auth["user_secret"],
+                trade_id=trade_id,
+                wait_to_confirm=wait_to_confirm,
+            )
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] place_equity_order failed trade_id=%s: %s",
+                trade_id,
+                e,
+            )
+            raise
+        body = getattr(resp, "body", None) or {}
+        return json.loads(json.dumps(_safe(body)))
+
+    def cancel_equity_order(
+        self,
+        app_user_id: str,
+        *,
+        account_id: str,
+        brokerage_order_id: str,
+    ) -> dict:
+        """Cancel an open equity order at the brokerage."""
+        auth = self._require_auth(app_user_id)
+        try:
+            resp = self._client.trading.cancel_order(
+                user_id=auth["snaptrade_user_id"],
+                user_secret=auth["user_secret"],
+                account_id=account_id,
+                brokerage_order_id=brokerage_order_id,
+            )
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] cancel_equity_order failed account=%s order=%s: %s",
+                account_id,
+                brokerage_order_id,
+                e,
+            )
+            raise
+        body = getattr(resp, "body", None) or {}
+        return json.loads(json.dumps(_safe(body)))
+
+    def preview_crypto_order(
+        self,
+        app_user_id: str,
+        *,
+        account_id: str,
+        instrument: str,
+        side: str,
+        order_type: str,
+        time_in_force: str,
+        amount: float,
+        price: float | None = None,
+    ) -> dict:
+        """Preview a crypto pair order. Crypto uses a different endpoint and
+        body shape than equities (``instrument`` is a pair like ``BTC/USD``).
+        """
+        auth = self._require_auth(app_user_id)
+        body: dict[str, Any] = {
+            "account_id": account_id,
+            "instrument": instrument,
+            "side": side.upper(),
+            "type": _map_order_type(order_type),
+            "time_in_force": _map_time_in_force(time_in_force),
+            "amount": float(amount),
+        }
+        if price is not None:
+            body["price"] = float(price)
+        try:
+            resp = self._client.trading.preview_crypto_order(
+                body=body,
+                user_id=auth["snaptrade_user_id"],
+                user_secret=auth["user_secret"],
+            )
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] preview_crypto_order failed account=%s pair=%s: %s",
+                account_id,
+                instrument,
+                e,
+            )
+            raise
+        out = getattr(resp, "body", None) or {}
+        return json.loads(json.dumps(_safe(out)))
+
+    def place_crypto_order(
+        self,
+        app_user_id: str,
+        *,
+        account_id: str,
+        instrument: str,
+        side: str,
+        order_type: str,
+        time_in_force: str,
+        amount: float,
+        price: float | None = None,
+    ) -> dict:
+        """Place a crypto pair order directly (no two-phase preview in the SDK)."""
+        auth = self._require_auth(app_user_id)
+        body: dict[str, Any] = {
+            "account_id": account_id,
+            "instrument": instrument,
+            "side": side.upper(),
+            "type": _map_order_type(order_type),
+            "time_in_force": _map_time_in_force(time_in_force),
+            "amount": float(amount),
+        }
+        if price is not None:
+            body["price"] = float(price)
+        try:
+            resp = self._client.trading.place_crypto_order(
+                body=body,
+                user_id=auth["snaptrade_user_id"],
+                user_secret=auth["user_secret"],
+            )
+        except ApiException as e:
+            logger.warning(
+                "[snaptrade] place_crypto_order failed account=%s pair=%s: %s",
+                account_id,
+                instrument,
+                e,
+            )
+            raise
+        out = getattr(resp, "body", None) or {}
+        return json.loads(json.dumps(_safe(out)))
+
+
+# ----------------------------------------------------------------------
+# Small helpers for mapping our canonical enum values → SnapTrade SDK
+# strings. Keeping them at module level makes them trivially unit-testable.
+# ----------------------------------------------------------------------
+
+
+_ORDER_TYPE_MAP = {
+    "market": "Market",
+    "limit": "Limit",
+    "stop": "Stop",
+    "stop_limit": "StopLimit",
+}
+
+_TIF_MAP = {
+    "day": "Day",
+    "gtc": "GTC",
+    "fok": "FOK",
+    "ioc": "IOC",
+}
+
+
+def _map_order_type(value: str) -> str:
+    key = (value or "").lower().replace("-", "_")
+    return _ORDER_TYPE_MAP.get(key, value)
+
+
+def _map_time_in_force(value: str) -> str:
+    key = (value or "").lower()
+    return _TIF_MAP.get(key, value.upper() if value else "Day")
+
 
 @lru_cache
 def get_snaptrade_service() -> SnapTradeService:

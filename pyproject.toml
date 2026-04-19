@@ -22,6 +22,7 @@ dependencies = [
     "feedparser",
     "tenacity",
     "httpx",
+    "exchange-calendars>=4.5",
 ]
 requires-python = ">=3.11"
 
