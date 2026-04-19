@@ -8,6 +8,20 @@ class SnapTradeAccountBalance(BaseModel):
     currency: str | None = None
 
 
+class SnapTradeAccountSync(BaseModel):
+    """Subset of ``account.sync_status`` the frontend actually uses.
+
+    Fidelity (and some other brokers) return an account with a NULL balance
+    until SnapTrade's first holdings sync finishes — the frontend checks
+    these flags to show "Syncing…" instead of "$0.00".
+    """
+
+    holdings_initial_sync_completed: bool | None = None
+    transactions_initial_sync_completed: bool | None = None
+    holdings_last_successful_sync: str | None = None
+    transactions_last_successful_sync: str | None = None
+
+
 class SnapTradeAccount(BaseModel):
     """Rich brokerage account object returned by GET /snaptrade/accounts."""
 
@@ -19,7 +33,12 @@ class SnapTradeAccount(BaseModel):
     status: str | None = None
     is_paper: bool | None = None
     balance_total: float | None = Field(None, description="Total account value in account currency")
+    balance_cash: float | None = Field(None, description="Cash balance — used as fallback when total is null")
     balance_currency: str | None = None
+    sync: SnapTradeAccountSync = Field(
+        default_factory=SnapTradeAccountSync,
+        description="Sync state — when holdings_initial_sync_completed is false, show 'Syncing…' in the UI",
+    )
     # Pass through the raw SnapTrade object for anything the frontend needs
     # that we haven't explicitly typed above.
     raw: dict[str, Any] = Field(default_factory=dict)

@@ -285,7 +285,31 @@ class SnapTradeService:
         for acc in safe_list:
             balance = acc.get("balance") or {}
             total_obj = balance.get("total") or {}
+            cash_obj = balance.get("cash") or {}
             meta = acc.get("meta") or {}
+            sync_status = acc.get("sync_status") or {}
+            holdings_sync = sync_status.get("holdings") or {}
+            tx_sync = sync_status.get("transactions") or {}
+
+            balance_total = total_obj.get("amount")
+            balance_cash = cash_obj.get("amount")
+            balance_currency = total_obj.get("currency") or cash_obj.get("currency")
+
+            # Fidelity (and some other brokers) leave balance.total null until
+            # SnapTrade's first holdings sync finishes. Fall back to cash so we
+            # at least show *something* instead of "$0.00".
+            effective_total = balance_total if balance_total is not None else balance_cash
+
+            if balance_total is None:
+                logger.info(
+                    "[snaptrade] account=%s institution=%s has null balance.total "
+                    "(holdings_sync_completed=%s) — surfacing cash=%s",
+                    acc.get("id"),
+                    acc.get("institution_name") or meta.get("institution_name"),
+                    holdings_sync.get("initial_sync_completed"),
+                    balance_cash,
+                )
+
             out.append({
                 "id": acc.get("id", ""),
                 "name": acc.get("name"),
@@ -294,8 +318,15 @@ class SnapTradeService:
                 "account_type": meta.get("type") or acc.get("account_type"),
                 "status": meta.get("status") or acc.get("status"),
                 "is_paper": acc.get("is_paper"),
-                "balance_total": total_obj.get("amount"),
-                "balance_currency": total_obj.get("currency"),
+                "balance_total": effective_total,
+                "balance_cash": balance_cash,
+                "balance_currency": balance_currency,
+                "sync": {
+                    "holdings_initial_sync_completed": holdings_sync.get("initial_sync_completed"),
+                    "transactions_initial_sync_completed": tx_sync.get("initial_sync_completed"),
+                    "holdings_last_successful_sync": holdings_sync.get("last_successful_sync"),
+                    "transactions_last_successful_sync": tx_sync.get("last_successful_sync"),
+                },
                 "raw": acc,
             })
         return out
@@ -528,6 +559,33 @@ class SnapTradeService:
                 "raw": auth,
             })
         return out
+
+    def refresh_connection(self, app_user_id: str, authorization_id: str) -> dict:
+        """Ask SnapTrade to re-pull holdings for a single authorization.
+
+        Useful immediately after a user connects Fidelity (or any broker
+        whose initial sync is slow) so balances and positions appear without
+        waiting for the next polling cycle. Returns the raw SnapTrade
+        response so the route can surface ``sync_status`` back to the UI.
+        """
+        row = select_maybe(_TABLE, "snaptrade_user_id", "user_secret", filters={"app_user_id": app_user_id})
+        if not row:
+            raise LookupError(
+                "No SnapTrade registration found for this user. "
+                "Call POST /snaptrade/connect first."
+            )
+        resp = self._client.connections.refresh_brokerage_authorization(
+            authorization_id=authorization_id,
+            user_id=row["snaptrade_user_id"],
+            user_secret=row["user_secret"],
+        )
+        logger.info(
+            "[snaptrade] refreshed authorization_id=%s for app_user_id=%s",
+            authorization_id,
+            app_user_id,
+        )
+        body = getattr(resp, "body", None)
+        return json.loads(json.dumps(_safe(body))) if body is not None else {}
 
     def remove_connection(self, app_user_id: str, authorization_id: str) -> None:
         """Revoke a single brokerage authorization.

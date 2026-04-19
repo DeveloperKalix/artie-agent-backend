@@ -215,6 +215,33 @@ async def list_connections(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
+@router.post("/connections/{authorization_id}/refresh")
+async def refresh_connection(
+    authorization_id: str,
+    user_id: str = Depends(_resolve_user_id),
+    svc: SnapTradeService = Depends(get_snaptrade_service),
+) -> dict:
+    """Ask SnapTrade to re-pull holdings for this authorization.
+
+    Call this right after a user finishes connecting Fidelity (or any broker
+    with a slow initial sync) so the next ``GET /snaptrade/accounts`` shows
+    real balances instead of ``$0.00``. Returns the updated sync_status.
+    """
+    logger.info(
+        "[snaptrade] POST /snaptrade/connections/%s/refresh user_id=%s",
+        authorization_id,
+        user_id,
+    )
+    try:
+        return svc.refresh_connection(user_id, authorization_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ApiException as e:
+        raise _snaptrade_http(e) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
 @router.delete("/connections/{authorization_id}", status_code=204)
 async def remove_connection(
     authorization_id: str,

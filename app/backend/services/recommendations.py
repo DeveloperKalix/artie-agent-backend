@@ -9,17 +9,17 @@ Pulls everything the LLM needs to reason about a user's portfolio:
 - Free-form memory notes (from ``user_memory``, captured via ``/skill``).
 - The rolling conversation context (when invoked from a conversation).
 
-Ships two surfaces:
+Ships three surfaces:
 
 1. ``generate(user_id)`` — full structured recommendations. JSON-mode Groq
-   response validated against :class:`RecommendationResponse`. Used by
-   ``POST /recommendations``.
-2. ``chat(user_id, message, history)`` — conversational reply grounded in the
+   response validated against :class:`RecommendationResponse`, then persisted
+   to ``public.user_recommendations`` with a stable fingerprint so repeated
+   POSTs never duplicate the same foresight. Used by ``POST /recommendations``.
+2. ``list_recommendations(user_id)`` — returns ``(new, viewed)`` pulled from
+   the persistent store. Used by ``GET /recommendations``.
+3. ``chat(user_id, message, history)`` — conversational reply grounded in the
    same context. Used by the orchestrator when the incoming message isn't a
-   ``/skill`` command. Returns plain text and optional structured recs.
-
-Both paths share a single ``_build_system_prompt`` so tone, disclaimer, and
-experience-level tailoring stay consistent.
+   ``/skill`` command. Returns plain text.
 
 All external I/O (SnapTrade REST, Supabase, Groq) runs through
 ``asyncio.to_thread`` since the underlying SDKs are synchronous. The agent
@@ -29,15 +29,18 @@ downstream API call.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
+from app.backend.core.redis import get_redis
 from app.backend.core.supabase import (
     count_news_for_tickers_since,
     select_maybe,
+    update_rows,
     upsert_row,
 )
 from app.backend.services.memory import MemoryService, get_memory_service
@@ -53,10 +56,25 @@ from app.schemas.news import (
 logger = logging.getLogger(__name__)
 
 _CURSOR_TABLE = "user_news_cursor"
+_RECOMMENDATIONS_TABLE = "user_recommendations"
 _RECOMMENDATION_MODEL = "llama-3.3-70b-versatile"
 _CHAT_MODEL = "llama-3.3-70b-versatile"
 _MAX_CONTEXT_TURNS = 12  # how many prior turns we pass to the chat model
-_MAX_NEWS_FOR_PROMPT = 20
+_MAX_NEWS_FOR_PROMPT = 40
+_MAX_VIEWED_RETURN = 50  # cap on "previously viewed" rows returned to client
+# If the user's cursor has advanced past most news, the LLM ends up with a
+# starvation-thin context and keeps producing the same single foresight.
+# When ``len(news) < _MIN_NEWS_BEFORE_WIDEN`` we re-query ignoring the cursor
+# so the model always sees a usable pool — dedup is handled by fingerprinting.
+_MIN_NEWS_BEFORE_WIDEN = 8
+# Auto-generation cooldown (seconds). ``GET /recommendations`` will silently
+# trigger a fresh generation when the unviewed feed is empty and there is
+# pending news, but only once per user per cooldown window. This keeps Groq
+# usage bounded no matter how aggressively the frontend polls.
+_AUTOGEN_COOLDOWN_SECONDS = 180
+_AUTOGEN_LOCK_PREFIX = "recs:autogen:"
+
+_CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
 
 _TONE_BY_LEVEL: dict[ExperienceLevel, str] = {
     ExperienceLevel.novice: (
@@ -124,20 +142,29 @@ class RecommendationAgent:
     # ------------------------------------------------------------ public API
 
     async def generate(self, user_id: str) -> RecommendationResponse:
-        """Produce structured portfolio recommendations for the user."""
+        """Produce structured foresights for the user.
+
+        Persists new (by fingerprint) rows to ``user_recommendations`` and
+        returns the complete unviewed feed so the frontend can render the
+        "new foresights" section on one round trip.
+        """
         ctx = await self._collect_context(user_id)
         system_prompt = self._build_system_prompt(ctx, mode="recommendations")
         user_prompt = self._build_user_prompt_for_recommendations(ctx)
 
         raw = await self._call_groq_json(system_prompt, user_prompt)
-        recommendations = self._parse_recommendations(raw, ctx.news)
+        fresh = self._parse_recommendations(raw, ctx.news)
+        logger.info(
+            "[recommendations] user=%s llm_raw=%d parsed=%d",
+            user_id,
+            len(raw.get("recommendations") or []) if isinstance(raw, dict) else 0,
+            len(fresh),
+        )
+
+        inserted = await self._persist_recommendations(user_id, fresh)
+        unviewed = await self._list_unviewed(user_id)
 
         generated_at = datetime.now(tz=timezone.utc).isoformat()
-        response = RecommendationResponse(
-            user_id=user_id,
-            recommendations=recommendations,
-            generated_at=generated_at,
-        )
 
         # Only advance the cursor for users with real equity positions.
         # Users with no investable holdings (new users / cash-only) always
@@ -145,29 +172,114 @@ class RecommendationAgent:
         # advancing the cursor would filter out all news on the next call.
         if ctx.has_equity_positions:
             await self._update_cursor(user_id, datetime.now(tz=timezone.utc))
-        return response
+
+        return RecommendationResponse(
+            user_id=user_id,
+            recommendations=unviewed,
+            generated_at=generated_at,
+            new_count=len(inserted),
+        )
+
+    async def list_recommendations(
+        self, user_id: str
+    ) -> tuple[list[PortfolioRecommendation], list[PortfolioRecommendation]]:
+        """Return ``(new, viewed)`` foresights straight from the store.
+
+        When the ``new`` list is empty and there is actually news to reason
+        about, transparently kick off a generation — rate-limited per user
+        via a Redis cooldown so repeated GETs never stampede Groq. The
+        frontend therefore doesn't need to explicitly POST; polling this
+        endpoint is enough to keep foresights flowing.
+        """
+        new_rows = await asyncio.to_thread(_select_unviewed_rows, user_id, 100)
+        viewed_rows = await asyncio.to_thread(
+            _select_viewed_rows, user_id, _MAX_VIEWED_RETURN
+        )
+
+        if not new_rows and await self._should_autogen(user_id):
+            try:
+                logger.info(
+                    "[recommendations] user=%s auto-generating (empty feed)",
+                    user_id,
+                )
+                await self.generate(user_id)
+            except Exception:
+                logger.exception(
+                    "[recommendations] auto-generate failed for user=%s", user_id
+                )
+            else:
+                new_rows = await asyncio.to_thread(
+                    _select_unviewed_rows, user_id, 100
+                )
+
+        return (
+            [_row_to_recommendation(r) for r in new_rows],
+            [_row_to_recommendation(r) for r in viewed_rows],
+        )
+
+    async def _should_autogen(self, user_id: str) -> bool:
+        """Return True iff we should auto-generate right now.
+
+        Gates on two things: (1) a Redis SETNX lock so only one concurrent
+        caller per user triggers Groq, and (2) either pending news exists or
+        the user has no investable positions (cold-start first-picks).
+        """
+        redis = get_redis()
+        lock_key = f"{_AUTOGEN_LOCK_PREFIX}{user_id}"
+        try:
+            acquired = await redis.set(
+                lock_key, "1", ex=_AUTOGEN_COOLDOWN_SECONDS, nx=True
+            )
+        except Exception:
+            logger.warning(
+                "[recommendations] redis unavailable — skipping autogen lock",
+                exc_info=True,
+            )
+            return False
+        if not acquired:
+            return False
+
+        status = await self.check_for_new_news(user_id)
+        has_tickers = bool(status.get("tickers"))
+        pending = int(status.get("pending_news_count") or 0)
+        # Cold-start users (no tickers) always have "pending" general news,
+        # so rely on the lock alone to rate-limit them.
+        return (not has_tickers) or pending > 0
+
+    async def mark_viewed(self, user_id: str, recommendation_id: str) -> bool:
+        """Flip ``viewed_at`` to now for this rec if it belongs to the user.
+
+        Returns ``True`` if a row was updated, ``False`` otherwise.
+        """
+        now = datetime.now(tz=timezone.utc).isoformat()
+
+        def _apply() -> list[Any]:
+            return update_rows(
+                _RECOMMENDATIONS_TABLE,
+                {"viewed_at": now},
+                filters={"id": recommendation_id, "user_id": user_id},
+            )
+
+        updated = await asyncio.to_thread(_apply)
+        return bool(updated)
 
     async def check_for_new_news(self, user_id: str) -> dict[str, Any]:
         """Cheap status check — no LLM call, no cursor advancement.
 
-        Loads the user's positions and cursor concurrently, then issues a
-        single count query against ``news_items``. The frontend can call this
-        on every app-foreground event to decide whether to show a badge.
-
-        Returns::
-
-            {
-                "has_new": bool,
-                "new_count": int,
-                "last_seen_at": ISO-8601 string | None,
-                "tickers": [str, ...],
-            }
+        Returns both the number of unviewed stored foresights (the primary
+        badge the frontend should render) and the number of news items since
+        the user's cursor (secondary — signals whether a fresh POST would
+        yield anything new).
         """
         positions_task = asyncio.create_task(_load_positions(user_id))
         cursor_task = asyncio.create_task(_load_cursor(user_id))
-        positions, cursor = await asyncio.gather(positions_task, cursor_task)
+        unviewed_task = asyncio.create_task(
+            asyncio.to_thread(_count_unviewed, user_id)
+        )
+        positions, cursor, unviewed_count = await asyncio.gather(
+            positions_task, cursor_task, unviewed_task
+        )
 
-        _CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
         tickers = sorted(
             {
                 t.upper()
@@ -178,24 +290,19 @@ class RecommendationAgent:
         )
 
         if not tickers:
-            # No investable positions — always show the badge since general
-            # market news is always available to help with first-pick decisions.
-            new_count = await asyncio.to_thread(
+            # No investable positions — general market news is always available.
+            pending_news = await asyncio.to_thread(
                 count_news_for_tickers_since, [], None
             )
-            return {
-                "has_new": new_count > 0,
-                "new_count": new_count,
-                "last_seen_at": None,
-                "tickers": [],
-            }
+        else:
+            pending_news = await asyncio.to_thread(
+                count_news_for_tickers_since, tickers, cursor
+            )
 
-        new_count = await asyncio.to_thread(
-            count_news_for_tickers_since, tickers, cursor
-        )
         return {
-            "has_new": new_count > 0,
-            "new_count": new_count,
+            "has_new": unviewed_count > 0 or pending_news > 0,
+            "new_count": unviewed_count,
+            "pending_news_count": pending_news,
             "last_seen_at": cursor.isoformat() if cursor else None,
             "tickers": tickers,
         }
@@ -236,7 +343,6 @@ class RecommendationAgent:
 
         # Filter money-market / cash-equivalent tickers that never appear in
         # news feeds so we don't constrain the query to meaningless tickers.
-        _CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
         tickers = sorted(
             {
                 t.upper()
@@ -247,19 +353,44 @@ class RecommendationAgent:
         )
 
         if tickers:
-            # User has real equity positions — fetch news for those tickers
-            # since their last check.
             news = await self._news.get_recent_news_for_user(
                 user_id=user_id,
                 tickers=tickers,
                 since=cursor,
                 limit=_MAX_NEWS_FOR_PROMPT,
             )
+            # Starvation guard: if the cursor has advanced past most news, the
+            # LLM has nothing to work with and keeps repeating the same
+            # foresight. Widen the window to the full available pool for
+            # these tickers — fingerprinting still prevents duplicates.
+            if len(news) < _MIN_NEWS_BEFORE_WIDEN:
+                logger.info(
+                    "[recommendations] user=%s widening news window "
+                    "(cursor=%s yielded only %d items)",
+                    user_id,
+                    cursor.isoformat() if cursor else None,
+                    len(news),
+                )
+                news = await self._news.get_recent_news_for_user(
+                    user_id=user_id,
+                    tickers=tickers,
+                    since=None,
+                    limit=_MAX_NEWS_FOR_PROMPT,
+                )
         else:
             # No investable positions yet (new user or only cash equivalents).
             # Ignore the cursor so we always supply fresh general market news
             # to the LLM — this enables first-pick / discovery recommendations.
             news = await self._news.recent(limit=_MAX_NEWS_FOR_PROMPT)
+
+        logger.info(
+            "[recommendations] user=%s ctx tickers=%d news=%d notes=%d positions=%d",
+            user_id,
+            len(tickers),
+            len(news),
+            len(notes),
+            len(positions),
+        )
 
         ctx = _Ctx()
         ctx.positions = positions
@@ -267,7 +398,6 @@ class RecommendationAgent:
         ctx.profile = profile
         ctx.notes = notes
         ctx.cursor = cursor
-        # Flag so generate() knows not to advance the cursor for cursor-less users.
         ctx.has_equity_positions = bool(tickers)
         return ctx
 
@@ -345,9 +475,13 @@ class RecommendationAgent:
                 "articles above."
             )
         return (
-            "Given my positions and the news since my last check, what "
-            "actions should I consider? Only include recommendations that are "
-            "clearly supported by one or more of the news items above."
+            "Given my positions and the news above, produce between 3 and 6 "
+            "distinct foresights. Cover different tickers whenever the news "
+            "supports it — do not return only a single recommendation unless "
+            "the news truly only concerns one ticker. For every foresight, "
+            "cite at least one article URL from the list above in "
+            "``article_urls`` (verbatim). It is fine to include a hold or "
+            "reduce call on a position that appears fragile in the news."
         )
 
     # ------------------------------------------------------------- Groq calls
@@ -362,10 +496,17 @@ class RecommendationAgent:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                temperature=0.2,
+                temperature=0.45,
                 response_format={"type": "json_object"},
             )
             text = completion.choices[0].message.content or "{}"
+            # Truncated preview at INFO so we can see what Groq actually
+            # emitted without leaking full prompts into logs.
+            logger.info(
+                "[recommendations] Groq JSON (%d chars): %s",
+                len(text),
+                text[:500].replace("\n", " "),
+            )
             try:
                 return json.loads(text)
             except json.JSONDecodeError:
@@ -397,12 +538,7 @@ class RecommendationAgent:
     def _parse_recommendations(
         raw: dict[str, Any], news: list[NewsItem]
     ) -> list[PortfolioRecommendation]:
-        """Map the LLM's JSON into validated recommendations, resolving URLs.
-
-        The LLM emits ``article_urls`` (a list of strings); we match them
-        against the news we actually showed it so the response always contains
-        real :class:`NewsItem` objects the frontend can link to.
-        """
+        """Map the LLM's JSON into validated recommendations, resolving URLs."""
         url_index: dict[str, NewsItem] = {n.url: n for n in news}
         out: list[PortfolioRecommendation] = []
         for entry in (raw.get("recommendations") or []):
@@ -415,6 +551,14 @@ class RecommendationAgent:
                     for url in supporting_urls
                     if isinstance(url, str) and url in url_index
                 ]
+                if supporting_urls and not supporting:
+                    logger.warning(
+                        "[recommendations] LLM cited %d URL(s) for %s but none "
+                        "matched the news pool — likely hallucinated: %r",
+                        len(supporting_urls),
+                        entry.get("ticker"),
+                        supporting_urls[:3],
+                    )
                 rec = PortfolioRecommendation(
                     ticker=str(entry.get("ticker", "")).upper() or "?",
                     action=str(entry.get("action", "hold")).lower(),
@@ -431,6 +575,71 @@ class RecommendationAgent:
                 continue
             out.append(rec)
         return out
+
+    # ------------------------------------------------------ persistence utils
+
+    async def _persist_recommendations(
+        self,
+        user_id: str,
+        fresh: list[PortfolioRecommendation],
+    ) -> list[PortfolioRecommendation]:
+        """Upsert-ignore by fingerprint; return only rows newly inserted."""
+        if not fresh:
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for rec in fresh:
+            fp = _fingerprint(rec)
+            rows.append(
+                {
+                    "user_id": user_id,
+                    "ticker": rec.ticker,
+                    "action": rec.action,
+                    "confidence": rec.confidence,
+                    "explanation": rec.explanation,
+                    "supporting_articles": [
+                        a.model_dump(mode="json") for a in rec.supporting_articles
+                    ],
+                    "fingerprint": fp,
+                }
+            )
+
+        def _apply() -> list[Any]:
+            # on_conflict + ignore_duplicates means PostgREST returns only
+            # rows that were actually inserted — repeat foresights are skipped.
+            from app.backend.core.supabase import upsert_rows as _upsert_rows
+
+            return _upsert_rows(
+                _RECOMMENDATIONS_TABLE,
+                rows,
+                on_conflict="user_id,fingerprint",
+                ignore_duplicates=True,
+            )
+
+        try:
+            inserted_rows = await asyncio.to_thread(_apply)
+        except Exception:
+            logger.exception(
+                "[recommendations] failed to persist %d rows for user=%s",
+                len(rows),
+                user_id,
+            )
+            return []
+
+        inserted = [_row_to_recommendation(r) for r in inserted_rows or []]
+        logger.info(
+            "[recommendations] user=%s persisted=%d/%d",
+            user_id,
+            len(inserted),
+            len(rows),
+        )
+        return inserted
+
+    async def _list_unviewed(
+        self, user_id: str
+    ) -> list[PortfolioRecommendation]:
+        rows = await asyncio.to_thread(_select_unviewed_rows, user_id, 100)
+        return [_row_to_recommendation(r) for r in rows]
 
     # ---------------------------------------------------------- cursor utils
 
@@ -450,6 +659,50 @@ class RecommendationAgent:
 
 
 # ------------------------------------------------------------ module helpers
+
+
+def _fingerprint(rec: PortfolioRecommendation) -> str:
+    """Stable identity for dedup: ticker + action + sorted article URLs.
+
+    Confidence is intentionally excluded so two near-identical foresights
+    generated moments apart on the same news don't duplicate just because
+    the LLM nudged the confidence label.
+    """
+    urls = sorted({a.url for a in rec.supporting_articles if a.url})
+    payload = "|".join(
+        [rec.ticker.upper(), rec.action.lower(), *urls]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_to_recommendation(row: dict[str, Any]) -> PortfolioRecommendation:
+    articles_raw = row.get("supporting_articles") or []
+    articles: list[NewsItem] = []
+    for a in articles_raw:
+        if not isinstance(a, dict):
+            continue
+        try:
+            articles.append(NewsItem(**a))
+        except Exception:
+            logger.debug("[recommendations] skipped malformed article %r", a)
+    return PortfolioRecommendation(
+        id=row.get("id"),
+        ticker=str(row.get("ticker", "?")),
+        action=str(row.get("action", "hold")),
+        confidence=str(row.get("confidence", "low")),
+        explanation=str(row.get("explanation", "")),
+        supporting_articles=articles,
+        generated_at=_as_iso(row.get("generated_at")),
+        viewed_at=_as_iso(row.get("viewed_at")),
+    )
+
+
+def _as_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
 
 
 async def _load_positions(user_id: str) -> list[dict[str, Any]]:
@@ -488,6 +741,55 @@ async def _load_cursor(user_id: str) -> datetime | None:
         return datetime.fromisoformat(str(row["last_seen_at"]).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _count_unviewed(user_id: str) -> int:
+    """Cheap count of ``user_recommendations`` rows with ``viewed_at IS NULL``."""
+    from app.backend.core.supabase import get_supabase
+
+    res = (
+        get_supabase()
+        .table(_RECOMMENDATIONS_TABLE)
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .is_("viewed_at", "null")
+        .execute()
+    )
+    return res.count if res.count is not None else len(res.data or [])
+
+
+def _select_unviewed_rows(user_id: str, limit: int) -> list[dict[str, Any]]:
+    """PostgREST ``is.null`` + order-by generated_at DESC."""
+    from app.backend.core.supabase import get_supabase
+
+    res = (
+        get_supabase()
+        .table(_RECOMMENDATIONS_TABLE)
+        .select("*")
+        .eq("user_id", user_id)
+        .is_("viewed_at", "null")
+        .order("generated_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+
+def _select_viewed_rows(user_id: str, limit: int) -> list[dict[str, Any]]:
+    """PostgREST ``not.is=null`` + order-by viewed_at DESC."""
+    from app.backend.core.supabase import get_supabase
+
+    res = (
+        get_supabase()
+        .table(_RECOMMENDATIONS_TABLE)
+        .select("*")
+        .eq("user_id", user_id)
+        .not_.is_("viewed_at", "null")
+        .order("viewed_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
 
 
 def _format_notes_block(notes: list[MemoryNote]) -> str:
