@@ -8,6 +8,7 @@ and return shapes stay consistent across services.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from functools import lru_cache
 from typing import Any, Mapping, Sequence, TypeVar
 
@@ -28,6 +29,9 @@ __all__ = [
     "select_rows",
     "select_one",
     "select_maybe",
+    "select_news_for_tickers",
+    "select_news_by_query",
+    "select_recent_news",
     "rpc",
 ]
 
@@ -194,3 +198,56 @@ def select_maybe(
 def rpc(fn_name: str, params: JSON | None = None) -> Any:
     res = get_supabase().rpc(fn_name, params or {}).execute()
     return res.data
+
+
+def select_news_for_tickers(
+    tickers: Sequence[str],
+    *,
+    since: datetime | None = None,
+    limit: int = 50,
+) -> list[JSON]:
+    """Return news_items whose ``tickers[]`` overlaps the provided list.
+
+    Uses the PostgREST ``overlaps`` filter (``&&`` in raw SQL) — the generic
+    ``select_rows`` helper can't express that since it only emits ``eq``.
+    Ordered by ``published_at DESC`` so freshly ingested rows surface first.
+    """
+    q = (
+        get_supabase()
+        .table("news_items")
+        .select("*")
+        .overlaps("tickers", list(tickers))
+    )
+    if since is not None:
+        q = q.gte("published_at", since.isoformat())
+    q = q.order("published_at", desc=True).limit(limit)
+    res = q.execute()
+    return res.data or []
+
+
+def select_news_by_query(query: str, *, limit: int = 50) -> list[JSON]:
+    """Free-text search over title + summary via PostgREST ``or`` + ``ilike``."""
+    pattern = f"%{query}%"
+    res = (
+        get_supabase()
+        .table("news_items")
+        .select("*")
+        .or_(f"title.ilike.{pattern},summary.ilike.{pattern}")
+        .order("published_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []
+
+
+def select_recent_news(*, limit: int = 50) -> list[JSON]:
+    """Most recent news items ordered by ``published_at DESC``."""
+    res = (
+        get_supabase()
+        .table("news_items")
+        .select("*")
+        .order("published_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data or []

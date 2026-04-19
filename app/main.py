@@ -1,19 +1,85 @@
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 from starlette.responses import HTMLResponse, JSONResponse
 from tinyfish import TinyFish  # Modern 2026 SDK import
 
+from app.backend.core.scheduler import build_scheduler
+from app.routes.conversations import router as conversations_router
 from app.routes.exchanges import router as exchanges_router
+from app.routes.news import router as news_router
 from app.routes.plaid import router as plaid_router
+from app.routes.profile import router as profile_router
+from app.routes.recommendations import router as recommendations_router
+from app.routes.skills import router as skills_router
 from app.routes.snaptrade import router as snaptrade_router
 
+# Surface INFO logs from our own modules under uvicorn's default stream handler.
+# ``force=True`` ensures this takes effect even if uvicorn has already attached
+# a root handler in a reload-spawned worker.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
+)
+
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start/stop background infrastructure alongside the ASGI app.
+
+    Wires the scheduler, registers the hourly news-ingest job, and kicks off
+    a boot-time ingest so the news table is populated before the first user
+    request hits ``/news`` or ``/recommendations``.
+    """
+    from app.backend.services.news import get_news_agent
+
+    scheduler = build_scheduler()
+    news_agent = get_news_agent()
+
+    interval_min = int(os.getenv("NEWS_INGEST_INTERVAL_MINUTES", "60"))
+    scheduler.add_job(
+        news_agent.ingest,
+        trigger="interval",
+        minutes=interval_min,
+        id="news_ingest",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    app.state.scheduler = scheduler
+    app.state.news_agent = news_agent
+    logger.info(
+        "[lifespan] scheduler started, news_ingest every %d minutes",
+        interval_min,
+    )
+
+    # Boot-time ingest (fire-and-forget so startup isn't blocked).
+    asyncio.create_task(_run_boot_ingest(news_agent))
+
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+        logger.info("[lifespan] scheduler stopped")
+
+
+async def _run_boot_ingest(news_agent) -> None:
+    try:
+        count = await news_agent.ingest()
+        logger.info("[lifespan] boot-time ingest inserted %d news items", count)
+    except Exception:
+        logger.exception("[lifespan] boot-time ingest failed")
 
 
 def _format_validation_message(errors: list[Any]) -> str:
@@ -31,9 +97,12 @@ def _format_validation_message(errors: list[Any]) -> str:
     return "; ".join(parts) if parts else "Invalid request"
 
 
-app = FastAPI(title="Artie: Agentic Remote Trader that's Intelligently Engineered.", 
-version="0.1.0", 
-description="Artie is a remote trader that assists you in manageing your investment from voice commands on your smartphone!")
+app = FastAPI(
+    title="Artie: Agentic Remote Trader that's Intelligently Engineered.",
+    version="0.1.0",
+    description="Artie is a remote trader that assists you in manageing your investment from voice commands on your smartphone!",
+    lifespan=lifespan,
+)
 
 
 @app.exception_handler(RequestValidationError)
@@ -75,18 +144,23 @@ app.add_middleware(
     ],
 )
 
-app.include_router(plaid_router, prefix="/api/v1")
-app.include_router(exchanges_router, prefix="/api/v1")
-app.include_router(snaptrade_router, prefix="/api/v1")
-# Also expose without /api/v1 prefix for shorter paths behind nginx.
-app.include_router(plaid_router, prefix="")
-app.include_router(exchanges_router, prefix="")
-app.include_router(snaptrade_router, prefix="")
+# Mount routers under both "/api/v1" (canonical) and "" (bare) so the existing
+# nginx config that strips "/api/v1" still works without code changes.
+for _prefix in ("/api/v1", ""):
+    app.include_router(plaid_router, prefix=_prefix)
+    app.include_router(exchanges_router, prefix=_prefix)
+    app.include_router(snaptrade_router, prefix=_prefix)
+    app.include_router(news_router, prefix=_prefix)
+    app.include_router(conversations_router, prefix=_prefix)
+    app.include_router(skills_router, prefix=_prefix)
+    app.include_router(profile_router, prefix=_prefix)
+    app.include_router(recommendations_router, prefix=_prefix)
 
 # Initialize Clients
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # The new TinyFish client for the 2026 hackathon
 tf_client = TinyFish(api_key=os.getenv("TINYFISH_API_KEY"))
+
 
 @app.get("/")
 def health_check():
@@ -143,18 +217,7 @@ async def plaid_link_https_callback(request: Request) -> HTMLResponse:
         },
     )
 
-@app.post("/process-voice")
-async def process_voice(file: UploadFile = File(...)):
-    # 1. Save and Transcribe via Groq
-    temp_filename = f"temp_{file.filename}"
-    with open(temp_filename, "wb") as buffer:
-        buffer.write(await file.read())
-    
-    with open(temp_filename, "rb") as audio:
-        transcription = groq_client.audio.transcriptions.create(
-            file=(temp_filename, audio.read()),
-            model="whisper-large-v3-turbo"
-        )
-    
-    os.remove(temp_filename)
-    return {"intent": transcription.text, "status": "received"}
+
+# Legacy ``POST /process-voice`` was removed in Phase 3. Voice uploads now go
+# through ``POST /conversations/{id}/messages/voice``, which persists the
+# transcript, runs the orchestrator, and returns a durable assistant message.

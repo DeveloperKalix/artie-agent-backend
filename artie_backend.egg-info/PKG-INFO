@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: artie-backend
+Version: 0.1.0
+Summary: Agentic investment remote backend
+Author: Mark Schmidt
+Requires-Python: >=3.11
+Requires-Dist: fastapi
+Requires-Dist: uvicorn[standard]
+Requires-Dist: groq
+Requires-Dist: python-multipart
+Requires-Dist: supabase
+Requires-Dist: requests
+Requires-Dist: yfinance
+Requires-Dist: pandas
+Requires-Dist: numpy<2.0.0
+Requires-Dist: tinyfish
+Requires-Dist: python-dotenv
+Requires-Dist: plaid-python>=24.0
