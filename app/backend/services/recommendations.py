@@ -36,10 +36,12 @@ from functools import lru_cache
 from typing import Any
 
 from app.backend.core.supabase import (
+    count_news_for_tickers_since,
     select_maybe,
     upsert_row,
 )
 from app.backend.services.memory import MemoryService, get_memory_service
+from app.backend.services.snaptrade import unwrap_snaptrade_ticker
 from app.backend.services.news import NewsAggregatorAgent, get_news_agent
 from app.schemas.memory import ExperienceLevel, MemoryNote, UserProfile
 from app.schemas.news import (
@@ -94,6 +96,7 @@ class _Ctx:
         "profile",
         "notes",
         "cursor",
+        "has_equity_positions",
     )
 
     def __init__(self) -> None:
@@ -102,6 +105,7 @@ class _Ctx:
         self.profile: UserProfile | None = None
         self.notes: list[MemoryNote] = []
         self.cursor: datetime | None = None
+        self.has_equity_positions: bool = False
 
 
 # ----------------------------------------------------------- RecommendationAgent
@@ -135,10 +139,66 @@ class RecommendationAgent:
             generated_at=generated_at,
         )
 
-        # Advance the user's news cursor to "now" only after a successful
-        # generation so a failed LLM call doesn't silently drop news.
-        await self._update_cursor(user_id, datetime.now(tz=timezone.utc))
+        # Only advance the cursor for users with real equity positions.
+        # Users with no investable holdings (new users / cash-only) always
+        # receive general market news so they can pick their first positions —
+        # advancing the cursor would filter out all news on the next call.
+        if ctx.has_equity_positions:
+            await self._update_cursor(user_id, datetime.now(tz=timezone.utc))
         return response
+
+    async def check_for_new_news(self, user_id: str) -> dict[str, Any]:
+        """Cheap status check — no LLM call, no cursor advancement.
+
+        Loads the user's positions and cursor concurrently, then issues a
+        single count query against ``news_items``. The frontend can call this
+        on every app-foreground event to decide whether to show a badge.
+
+        Returns::
+
+            {
+                "has_new": bool,
+                "new_count": int,
+                "last_seen_at": ISO-8601 string | None,
+                "tickers": [str, ...],
+            }
+        """
+        positions_task = asyncio.create_task(_load_positions(user_id))
+        cursor_task = asyncio.create_task(_load_cursor(user_id))
+        positions, cursor = await asyncio.gather(positions_task, cursor_task)
+
+        _CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
+        tickers = sorted(
+            {
+                t.upper()
+                for p in positions
+                if (t := unwrap_snaptrade_ticker(p.get("symbol")))
+                and t.upper() not in _CASH_EQUIVALENTS
+            }
+        )
+
+        if not tickers:
+            # No investable positions — always show the badge since general
+            # market news is always available to help with first-pick decisions.
+            new_count = await asyncio.to_thread(
+                count_news_for_tickers_since, [], None
+            )
+            return {
+                "has_new": new_count > 0,
+                "new_count": new_count,
+                "last_seen_at": None,
+                "tickers": [],
+            }
+
+        new_count = await asyncio.to_thread(
+            count_news_for_tickers_since, tickers, cursor
+        )
+        return {
+            "has_new": new_count > 0,
+            "new_count": new_count,
+            "last_seen_at": cursor.isoformat() if cursor else None,
+            "tickers": tickers,
+        }
 
     async def chat(
         self,
@@ -174,13 +234,32 @@ class RecommendationAgent:
             positions_task, profile_notes_task, cursor_task
         )
 
-        tickers = sorted({p["symbol"] for p in positions if p.get("symbol")})
-        news = await self._news.get_recent_news_for_user(
-            user_id=user_id,
-            tickers=tickers or None,
-            since=cursor,
-            limit=_MAX_NEWS_FOR_PROMPT,
+        # Filter money-market / cash-equivalent tickers that never appear in
+        # news feeds so we don't constrain the query to meaningless tickers.
+        _CASH_EQUIVALENTS = frozenset({"SPAXX", "FDRXX", "VMMXX", "VMFXX", "SWVXX"})
+        tickers = sorted(
+            {
+                t.upper()
+                for p in positions
+                if (t := unwrap_snaptrade_ticker(p.get("symbol")))
+                and t.upper() not in _CASH_EQUIVALENTS
+            }
         )
+
+        if tickers:
+            # User has real equity positions — fetch news for those tickers
+            # since their last check.
+            news = await self._news.get_recent_news_for_user(
+                user_id=user_id,
+                tickers=tickers,
+                since=cursor,
+                limit=_MAX_NEWS_FOR_PROMPT,
+            )
+        else:
+            # No investable positions yet (new user or only cash equivalents).
+            # Ignore the cursor so we always supply fresh general market news
+            # to the LLM — this enables first-pick / discovery recommendations.
+            news = await self._news.recent(limit=_MAX_NEWS_FOR_PROMPT)
 
         ctx = _Ctx()
         ctx.positions = positions
@@ -188,6 +267,8 @@ class RecommendationAgent:
         ctx.profile = profile
         ctx.notes = notes
         ctx.cursor = cursor
+        # Flag so generate() knows not to advance the cursor for cursor-less users.
+        ctx.has_equity_positions = bool(tickers)
         return ctx
 
     # ------------------------------------------------------- prompt builders
@@ -246,11 +327,22 @@ class RecommendationAgent:
 
     @staticmethod
     def _build_user_prompt_for_recommendations(ctx: _Ctx) -> str:
-        if not ctx.positions:
+        if not ctx.has_equity_positions:
+            prefs = (
+                "\n".join(f"- {n.content}" for n in ctx.notes)
+                if ctx.notes
+                else "(none stated yet)"
+            )
             return (
-                "I have no connected brokerage positions yet. Given the news "
-                "above, suggest a couple of general tickers worth researching, "
-                "but keep confidence low."
+                "I have no invested positions yet and I'm looking for my first "
+                "stock or ETF picks based on the news above.\n\n"
+                f"My stated investment preferences:\n{prefs}\n\n"
+                "Using only the news articles provided above, suggest 2–4 "
+                "specific tickers I should research. Use action='buy' with "
+                "confidence='low' since I haven't invested yet. "
+                "Tailor your suggestions to my preferences if any are stated — "
+                "otherwise pick the most newsworthy opportunities from the "
+                "articles above."
             )
         return (
             "Given my positions and the news since my last check, what "

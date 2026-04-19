@@ -7,8 +7,10 @@ from app.backend.services.snaptrade import SnapTradeService, get_snaptrade_servi
 from app.schemas.snaptrade import (
     SnapTradeAccountsResponse,
     SnapTradeAddBrokerBody,
+    SnapTradeBrokerageConnection,
     SnapTradeConnectBody,
     SnapTradeConnectResponse,
+    SnapTradeConnectionsResponse,
     SnapTradeHoldingsResponse,
     SnapTradeOrdersResponse,
     SnapTradePositionsResponse,
@@ -186,6 +188,53 @@ async def get_orders(
     try:
         orders = svc.get_orders(user_id)
         return SnapTradeOrdersResponse(orders=orders)
+    except ApiException as e:
+        raise _snaptrade_http(e) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@router.get("/connections", response_model=SnapTradeConnectionsResponse)
+async def list_connections(
+    user_id: str = Depends(_resolve_user_id),
+    svc: SnapTradeService = Depends(get_snaptrade_service),
+) -> SnapTradeConnectionsResponse:
+    """List all brokerage authorizations for the user.
+
+    Each connection has an ``id`` (authorization_id). Pass that id to
+    ``DELETE /snaptrade/connections/{authorization_id}`` to disconnect the
+    broker.
+    """
+    logger.info("[snaptrade] GET /snaptrade/connections user_id=%s", user_id)
+    try:
+        connections = svc.list_connections(user_id)
+        return SnapTradeConnectionsResponse(connections=connections)
+    except ApiException as e:
+        raise _snaptrade_http(e) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@router.delete("/connections/{authorization_id}", status_code=204)
+async def remove_connection(
+    authorization_id: str,
+    user_id: str = Depends(_resolve_user_id),
+    svc: SnapTradeService = Depends(get_snaptrade_service),
+) -> None:
+    """Revoke a brokerage authorization, disconnecting that broker for the user.
+
+    Returns 204 No Content on success. The frontend should remove the account
+    from its local state and call ``GET /snaptrade/accounts`` to refresh.
+    """
+    logger.info(
+        "[snaptrade] DELETE /snaptrade/connections/%s user_id=%s",
+        authorization_id,
+        user_id,
+    )
+    try:
+        svc.remove_connection(user_id, authorization_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except ApiException as e:
         raise _snaptrade_http(e) from e
     except RuntimeError as e:

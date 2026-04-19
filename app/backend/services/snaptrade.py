@@ -94,6 +94,40 @@ def _safe(obj: Any) -> Any:
     return str(obj)
 
 
+def unwrap_snaptrade_ticker(sym_obj: Any) -> str | None:
+    """Resolve SnapTrade nested ``symbol`` payloads to a plain ticker string.
+
+    The API may return ``symbol`` as a dict whose ``symbol`` field is another
+    dict (e.g. UniversalSymbol). Recurse until a string is found, with
+    fallbacks for ``raw_symbol`` / ``local_id`` / ``ticker`` / ``code``.
+    """
+    if sym_obj is None:
+        return None
+    if isinstance(sym_obj, str):
+        t = sym_obj.strip()
+        return t if t else None
+
+    cur: Any = sym_obj
+    for _ in range(8):
+        if cur is None:
+            return None
+        if isinstance(cur, str):
+            t = cur.strip()
+            return t if t else None
+        if isinstance(cur, dict):
+            nxt = cur.get("symbol")
+            if nxt is not None:
+                cur = nxt
+                continue
+            for key in ("raw_symbol", "local_id", "ticker", "code"):
+                v = cur.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            return None
+        return str(cur).strip() or None
+    return None
+
+
 class SnapTradeService:
     """Wraps the SnapTrade SDK with Supabase-backed user registration."""
 
@@ -317,7 +351,7 @@ class SnapTradeService:
 
             for pos in pos_list:
                 sym_obj = pos.get("symbol") or {}
-                sym_ticker = sym_obj.get("symbol") if isinstance(sym_obj, dict) else str(sym_obj)
+                sym_ticker = unwrap_snaptrade_ticker(sym_obj) or ""
                 description = (sym_obj.get("description") or sym_obj.get("name")) if isinstance(sym_obj, dict) else None
                 currency = (sym_obj.get("currency") or {}).get("code") if isinstance(sym_obj, dict) else None
                 asset_class = (sym_obj.get("type") or {}).get("code") if isinstance(sym_obj, dict) else None
@@ -385,7 +419,7 @@ class SnapTradeService:
         out: list[dict] = []
         for tx in raw_list:
             sym_obj = tx.get("symbol") or {}
-            symbol = sym_obj.get("symbol") if isinstance(sym_obj, dict) else str(sym_obj) if sym_obj else None
+            symbol = unwrap_snaptrade_ticker(sym_obj)
             desc = sym_obj.get("description") if isinstance(sym_obj, dict) else None
             currency_obj = tx.get("currency") or {}
             currency = currency_obj.get("code") if isinstance(currency_obj, dict) else str(currency_obj) if currency_obj else None
@@ -443,7 +477,7 @@ class SnapTradeService:
 
             for order in ord_list:
                 sym_obj = order.get("symbol") or {}
-                symbol = sym_obj.get("symbol") if isinstance(sym_obj, dict) else str(sym_obj) if sym_obj else None
+                symbol = unwrap_snaptrade_ticker(sym_obj)
 
                 orders_out.append({
                     "account_id": account_id,
@@ -462,6 +496,62 @@ class SnapTradeService:
                     "raw": order,
                 })
         return orders_out
+
+    def list_connections(self, app_user_id: str) -> list[dict]:
+        """Return all brokerage authorizations for the user.
+
+        Each dict contains an ``id`` (authorization_id) that the frontend
+        passes to ``remove_connection`` to disconnect a broker.
+        """
+        row = select_maybe(_TABLE, "snaptrade_user_id", "user_secret", filters={"app_user_id": app_user_id})
+        if not row:
+            return []
+
+        resp = self._client.connections.list_brokerage_authorizations(
+            user_id=row["snaptrade_user_id"],
+            user_secret=row["user_secret"],
+        )
+        raw_list: list[Any] = resp.body if isinstance(resp.body, list) else []
+        safe_list: list[dict] = json.loads(json.dumps(_safe(raw_list)))
+
+        out: list[dict] = []
+        for auth in safe_list:
+            brokerage = auth.get("brokerage") or {}
+            out.append({
+                "id": auth.get("id", ""),
+                "brokerage_id": brokerage.get("id") if isinstance(brokerage, dict) else str(brokerage),
+                "brokerage_name": brokerage.get("name") if isinstance(brokerage, dict) else None,
+                "type": auth.get("type"),
+                "created_date": auth.get("created_date"),
+                "disabled": auth.get("disabled"),
+                "disabled_date": auth.get("disabled_date"),
+                "raw": auth,
+            })
+        return out
+
+    def remove_connection(self, app_user_id: str, authorization_id: str) -> None:
+        """Revoke a single brokerage authorization.
+
+        Raises ``LookupError`` if the user isn't registered, and
+        ``ApiException`` (re-raised) for SnapTrade-level errors (e.g. unknown
+        authorization_id or permission denied).
+        """
+        row = select_maybe(_TABLE, "snaptrade_user_id", "user_secret", filters={"app_user_id": app_user_id})
+        if not row:
+            raise LookupError(
+                "No SnapTrade registration found for this user. "
+                "Call POST /snaptrade/connect first."
+            )
+        self._client.connections.remove_brokerage_authorization(
+            authorization_id=authorization_id,
+            user_id=row["snaptrade_user_id"],
+            user_secret=row["user_secret"],
+        )
+        logger.info(
+            "[snaptrade] removed authorization_id=%s for app_user_id=%s",
+            authorization_id,
+            app_user_id,
+        )
 
 
 @lru_cache

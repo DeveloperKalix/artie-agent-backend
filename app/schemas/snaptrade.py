@@ -167,3 +167,24 @@ class SnapTradeOrder(BaseModel):
 
 class SnapTradeOrdersResponse(BaseModel):
     orders: list[SnapTradeOrder]
+
+
+# ---------------------------------------------------------------------------
+# Brokerage connections (authorizations)
+# ---------------------------------------------------------------------------
+
+class SnapTradeBrokerageConnection(BaseModel):
+    """A single brokerage authorization (one per broker the user connected)."""
+
+    id: str = Field(..., description="authorization_id — pass to DELETE /snaptrade/connections/{id}")
+    brokerage_id: str | None = Field(None, description="SnapTrade brokerage id")
+    brokerage_name: str | None = Field(None, description="Human-readable broker name, e.g. 'Alpaca'")
+    type: str | None = Field(None, description="'read' or 'trade'")
+    created_date: str | None = None
+    disabled: bool | None = Field(None, description="True if the connection has been revoked / expired")
+    disabled_date: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class SnapTradeConnectionsResponse(BaseModel):
+    connections: list[SnapTradeBrokerageConnection]

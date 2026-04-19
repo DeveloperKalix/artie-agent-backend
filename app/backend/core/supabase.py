@@ -32,16 +32,32 @@ __all__ = [
     "select_news_for_tickers",
     "select_news_by_query",
     "select_recent_news",
+    "count_news_for_tickers_since",
     "rpc",
 ]
 
 
-@lru_cache
-def get_supabase() -> Client:
+@lru_cache(maxsize=1)
+def _supabase_credentials() -> tuple[str, str]:
+    """Cache the URL + key lookup (env reads) but not the client itself."""
     url = os.environ["SUPABASE_URL"]
-    # Prefer the service_role key for server-side writes (bypasses RLS).
-    # Falls back to SUPABASE_KEY (anon/publishable) if not set.
     key = os.environ.get("SUPABASE_SERVICE_ROLE") or os.environ["SUPABASE_KEY"]
+    return url, key
+
+
+def get_supabase() -> Client:
+    """Return a fresh Supabase client on every call.
+
+    ``supabase-py`` wraps a synchronous ``httpx.Client`` whose underlying
+    HTTP/2 connection is **not thread-safe**. When ``asyncio.to_thread``
+    dispatches concurrent Supabase calls they previously shared a single
+    cached client, causing ``[Errno 11] Resource temporarily unavailable``
+    (EAGAIN) on the shared socket. Creating a new client per call gives each
+    thread its own connection and eliminates the race condition. The overhead
+    is negligible — the TCP connection itself is reused by the OS-level
+    connection pool in httpcore.
+    """
+    url, key = _supabase_credentials()
     return create_client(url, key)
 
 
@@ -256,3 +272,23 @@ def select_recent_news(*, limit: int = 50) -> list[JSON]:
         .execute()
     )
     return res.data or []
+
+
+def count_news_for_tickers_since(
+    tickers: Sequence[str],
+    since: datetime | None,
+) -> int:
+    """Return the count of news_items matching ``tickers`` published after ``since``.
+
+    Uses ``select("id", count="exact")`` so PostgREST returns only the count
+    header — no row data is fetched, making this very cheap to call on every
+    app foreground event. ``since=None`` counts all matching items regardless
+    of publish date.
+    """
+    q = get_supabase().table("news_items").select("id", count="exact")
+    if tickers:
+        q = q.overlaps("tickers", list(tickers))
+    if since is not None:
+        q = q.gte("published_at", since.isoformat())
+    res = q.execute()
+    return res.count if res.count is not None else len(res.data or [])
