@@ -1,0 +1,41 @@
+# Virtual environment — largest offender (358MB); never needed in image
+.venv/
+
+# Byte-compiled / cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Egg / dist info
+*.egg-info/
+dist/
+build/
+
+# Git history
+.git/
+.gitignore
+
+# Editor / IDE
+.cursor/
+.vscode/
+*.swp
+*.swo
+
+# Docker files themselves
+.dockerignore
+docker-compose*.yml
+
+# Env files (secrets) — injected at runtime via docker-compose environment
+.env
+.env.*
+
+# Dev / test artefacts
+*.log
+.pytest_cache/
+htmlcov/
+.coverage
+
+# OS noise
+.DS_Store
+Thumbs.db
