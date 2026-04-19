@@ -1,7 +1,22 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: artie-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
   artiebk:  # The service is now named artiebk
     container_name: artiebk
     build: .
+    depends_on:
+      redis:
+        condition: service_healthy
     # Only nginx on the host should talk to the API (reverse proxy on 443/80).
     ports:
       - "127.0.0.1:8000:8000"
@@ -21,9 +36,15 @@ services:
       - PLAID_WEBHOOK_URL=${PLAID_WEBHOOK_URL:-}
       - SNAPTRADE_CLIENT_ID=${SNAPTRADE_CLIENT_ID:-}
       - SNAPTRADE_CONSUMER_KEY=${SNAPTRADE_CONSUMER_KEY:-}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - MARKETAUX_API_KEY=${MARKETAUX_API_KEY:-}
+      - NEWS_INGEST_INTERVAL_MINUTES=${NEWS_INGEST_INTERVAL_MINUTES:-60}
     volumes:
       # Mount only source — keeps the container's pip-installed site-packages intact.
       # The anonymous volume shields /app from being overwritten by the host .venv.
       - .:/app
       - /app/.venv
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  redis-data:

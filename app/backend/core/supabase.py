@@ -206,11 +206,12 @@ def select_news_for_tickers(
     since: datetime | None = None,
     limit: int = 50,
 ) -> list[JSON]:
-    """Return news_items whose ``tickers[]`` overlaps the provided list.
+    """Return news_items whose tickers[] overlaps the provided list.
 
-    Uses the PostgREST ``overlaps`` filter (``&&`` in raw SQL) — the generic
-    ``select_rows`` helper can't express that since it only emits ``eq``.
-    Ordered by ``published_at DESC`` so freshly ingested rows surface first.
+    Uses the PostgREST ``overlaps`` filter (``&&`` in raw SQL), which the
+    generic ``select_rows`` helper can't express since it only emits ``eq``.
+    Ordered by published_at DESC with NULL values last so freshly-ingested
+    rows without a publish date surface at the bottom.
     """
     q = (
         get_supabase()
@@ -225,7 +226,11 @@ def select_news_for_tickers(
     return res.data or []
 
 
-def select_news_by_query(query: str, *, limit: int = 50) -> list[JSON]:
+def select_news_by_query(
+    query: str,
+    *,
+    limit: int = 50,
+) -> list[JSON]:
     """Free-text search over title + summary via PostgREST ``or`` + ``ilike``."""
     pattern = f"%{query}%"
     res = (
@@ -241,7 +246,7 @@ def select_news_by_query(query: str, *, limit: int = 50) -> list[JSON]:
 
 
 def select_recent_news(*, limit: int = 50) -> list[JSON]:
-    """Most recent news items ordered by ``published_at DESC``."""
+    """Most recent news items ordered by published_at DESC."""
     res = (
         get_supabase()
         .table("news_items")

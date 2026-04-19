@@ -17,6 +17,11 @@ dependencies = [
     "python-dotenv",
     "plaid-python>=24.0",
     "snaptrade-python-sdk",
+    "redis[asyncio]>=5",
+    "apscheduler>=3.10",
+    "feedparser",
+    "tenacity",
+    "httpx",
 ]
 requires-python = ">=3.11"
 
